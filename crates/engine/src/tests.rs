@@ -326,6 +326,145 @@ fn add_keyframe_toggles_the_keyframe_at_the_playhead() {
     assert_eq!(scale(&s), (0, 100.0));
 }
 
+/// `effects.setParam` writes a keyframe only on an animated parameter. An agent that sends a value
+/// with a `time` to a parameter that is not animated gets a static value (the result says so:
+/// 0 keyframes); `"keyframe": true` is the stopwatch and the value in one step.
+#[test]
+fn set_param_writes_a_keyframe_when_asked_or_animated() {
+    let mut s = demo();
+    let c = s.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+    // (keyframes, static value, value at 0.5 s, value at 2.5 s)
+    let scale = |s: &Session| {
+        let it = s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(c)).unwrap().1;
+        let p = &it.effect("motion").unwrap().params["scale"];
+        let at = |seconds: f64| p.f64_at(it.source_time_at(Tick::from_seconds_f64(seconds)));
+        (p.keyframes.len(), p.value.as_f64().unwrap(), at(0.5), at(2.5))
+    };
+    let set = |value: f64, seconds: f64| json!({"clip": c, "effect": "motion", "param": "scale", "value": value, "seconds": seconds});
+    // not animated: the time is not used and the value is static
+    let r = s.execute("effects.setParam", set(80.0, 0.5)).unwrap();
+    assert_eq!(r["keyframes"], 0, "{r}");
+    assert_eq!(scale(&s), (0, 80.0, 80.0, 80.0));
+    // `keyframe`: the parameter becomes animated at that time
+    let mut first = set(60.0, 0.5);
+    first["keyframe"] = json!(true);
+    let r = s.execute("effects.setParam", first).unwrap();
+    assert_eq!(r["keyframes"], 1, "{r}");
+    assert_eq!(scale(&s).0, 1);
+    // animated now, so a plain set at another time is a second keyframe
+    let r = s.execute("effects.setParam", set(120.0, 2.5)).unwrap();
+    assert_eq!(r["keyframes"], 2, "{r}");
+    let (n, _, a, b) = scale(&s);
+    assert_eq!((n, a, b), (2, 60.0, 120.0));
+    // a keyframe that is already there is replaced, not doubled
+    let mut again = set(70.0, 0.5);
+    again["keyframe"] = json!(true);
+    assert_eq!(s.execute("effects.setParam", again).unwrap()["keyframes"], 2);
+    assert_eq!(scale(&s).2, 70.0);
+    s.undo();
+    assert_eq!(scale(&s).2, 60.0);
+    s.undo();
+    assert_eq!(scale(&s).0, 1);
+    s.redo();
+    s.redo();
+    let (n, _, a, b) = scale(&s);
+    assert_eq!((n, a, b), (2, 70.0, 120.0));
+    // a parameter that cannot be animated refuses the keyframe and keeps its value
+    let blend = json!({"clip": c, "effect": "opacity", "param": "blend", "value": 8, "keyframe": true});
+    let e = s.execute("effects.setParam", blend).unwrap_err().to_string();
+    assert!(e.contains("cannot be animated"), "{e}");
+    let it = s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(c)).unwrap().1;
+    assert_eq!(it.effect("opacity").unwrap().params["blend"].value, filmcraft_project::ParamValue::Choice(0));
+    // `keyframe` that is not a bool means no keyframe request
+    let mut odd = set(70.0, 0.5);
+    odd["keyframe"] = json!("yes");
+    assert_eq!(s.execute("effects.setParam", odd).unwrap()["keyframes"], 2);
+}
+
+/// A keyframe set with a `time` outside the clip stays at that time (#1055), before the start as
+/// after the end: a ramp that spans a cut shows its true slice, and a clip-end keyframe is not
+/// overwritten by a later one. Only the playhead fallback is pinned to the clip.
+#[test]
+fn set_param_keeps_a_keyframe_outside_the_clip_at_its_time() {
+    let mut s = demo();
+    let it = s.active_sequence().unwrap().video_tracks[0].items[1].clone();
+    let (c, start, end) = (it.id.0, it.start, it.end());
+    let opacity = |s: &Session| {
+        let it = s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(c)).unwrap().1;
+        let p = &it.effect("opacity").unwrap().params["opacity"];
+        (p.keyframes.iter().map(|k| (k.time, k.value.as_f64().unwrap())).collect::<Vec<_>>(), it.clone())
+    };
+    let set = |value: f64, time: Tick| json!({"clip": c, "effect": "opacity", "param": "opacity", "value": value, "time": time.0, "keyframe": true});
+    let len = end - start;
+    // Case A: a keyframe exactly at the clip end, then one past it, gives three keyframes
+    s.execute("effects.setParam", set(100.0, start)).unwrap();
+    s.execute("effects.setParam", set(100.0, end)).unwrap();
+    let r = s.execute("effects.setParam", set(20.0, end + len)).unwrap();
+    assert_eq!(r["keyframes"], 3, "{r}");
+    let (keys, it) = opacity(&s);
+    assert_eq!(keys, vec![(it.source_time_at(start), 100.0), (it.source_time_at(end), 100.0), (it.source_time_at(end + len), 20.0)]);
+    // Case B: a ramp past the end is not compressed; halfway through the clip is a quarter of the way down
+    s.undo();
+    s.undo();
+    let r = s.execute("effects.setParam", set(0.0, end + len)).unwrap();
+    assert_eq!(r["keyframes"], 2, "{r}");
+    let (_, it) = opacity(&s);
+    let p = it.effect("opacity").unwrap().params["opacity"].clone();
+    let mid = start + Tick(len.0 / 2);
+    assert!((p.f64_at(it.source_time_at(mid)) - 75.0).abs() < 0.5, "{}", p.f64_at(it.source_time_at(mid)));
+    // before the start the same holds: the keyframe keeps its time and the ramp its slope
+    s.undo();
+    s.undo();
+    s.execute("effects.setParam", set(0.0, start - len)).unwrap();
+    s.execute("effects.setParam", set(100.0, end)).unwrap();
+    let (keys, it) = opacity(&s);
+    assert_eq!(keys, vec![(it.source_time_at(start - len), 0.0), (it.source_time_at(end), 100.0)]);
+    let p = it.effect("opacity").unwrap().params["opacity"].clone();
+    assert!((p.f64_at(it.source_time_at(start)) - 50.0).abs() < 0.5, "{}", p.f64_at(it.source_time_at(start)));
+    // hostile times saturate instead of overflowing
+    for t in [i64::MIN, i64::MAX] {
+        s.execute("effects.setParam", json!({"clip": c, "effect": "opacity", "param": "opacity", "value": 50.0, "time": t})).unwrap();
+    }
+    // with no `time`, a playhead past the clip still lands on its last frame
+    s.undo();
+    s.undo();
+    s.execute("playhead.set", json!({"time": (end + len).0})).unwrap();
+    s.execute("effects.setParam", json!({"clip": c, "effect": "opacity", "param": "opacity", "value": 40.0})).unwrap();
+    let (keys, it) = opacity(&s);
+    assert!(keys.contains(&(it.source_time_at(end - Tick(1)), 40.0)), "{keys:?}");
+}
+
+/// A choice parameter takes its option name as well as its index, as transition parameters do
+/// (`effects.list {"detail": true}` lists the names).
+#[test]
+fn set_param_takes_a_choice_by_name() {
+    use filmcraft_project::ParamValue;
+    let mut s = demo();
+    let c = s.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+    let blend =
+        |s: &Session| s.active_sequence().unwrap().find_item(filmcraft_project::ClipId(c)).unwrap().1.effect("opacity").unwrap().params["blend"].value.clone();
+    let set = |value: serde_json::Value| json!({"clip": c, "effect": "opacity", "param": "blend", "value": value});
+    s.execute("effects.setParam", set(json!("Screen"))).unwrap();
+    assert_eq!(blend(&s), ParamValue::Choice(8));
+    s.execute("effects.setParam", set(json!("linear dodge (add)"))).unwrap();
+    assert_eq!(blend(&s), ParamValue::Choice(10), "names are matched without case");
+    s.execute("effects.setParam", set(json!(12))).unwrap();
+    assert_eq!(blend(&s), ParamValue::Choice(12), "an index works as before");
+    s.undo();
+    assert_eq!(blend(&s), ParamValue::Choice(10));
+    s.redo();
+    assert_eq!(blend(&s), ParamValue::Choice(12));
+    // a name that is not an option is an error that lists the options and changes nothing
+    let e = s.execute("effects.setParam", set(json!("Glow"))).unwrap_err().to_string();
+    assert!(e.contains("Screen") && e.contains("Overlay"), "{e}");
+    for bad in [json!(""), json!(null), json!([8]), json!({"name": "Screen"}), json!(-1), json!(1.5)] {
+        assert!(s.execute("effects.setParam", set(bad.clone())).is_err(), "{bad}");
+    }
+    assert_eq!(blend(&s), ParamValue::Choice(12));
+    // a name is still the wrong type for a parameter that is not a choice
+    assert!(s.execute("effects.setParam", json!({"clip": c, "effect": "motion", "param": "scale", "value": "Screen"})).is_err());
+}
+
 /// Dragging the Volume line or one of its keyframes in the timeline (#223) sends a keyframe edit
 /// every frame; `merge` keeps the whole drag one undo step and `begin` starts the next one.
 #[test]
@@ -731,6 +870,189 @@ fn dragging_an_effect_parameter_is_one_undo_step() {
     assert_eq!(opacity(&s), start, "and then the whole first one");
 }
 
+/// #639: a drag that changes several parameters (the anchor point and the position) shares one
+/// undo step when its changes carry the same `merge` key.
+#[test]
+fn a_merge_key_folds_several_parameters_into_one_undo_step() {
+    let mut s = demo_unlocked();
+    let id = v1(&s)[0].0;
+    let motion = |s: &Session| {
+        let it = s.active_sequence().unwrap().find_item(ClipId(id)).unwrap().1.clone();
+        let e = it.effect("motion").unwrap().clone();
+        (e.params["anchor"].value.clone(), e.params["position"].value.clone())
+    };
+    let start = motion(&s);
+    let undo = s.history.undo.len();
+    for (i, d) in [10.0, 20.0, 30.0].into_iter().enumerate() {
+        for param in ["anchor", "position"] {
+            let p = json!({"clip": id, "effect": "motion", "param": param, "value": [500.0 + d, 300.0 + d], "merge": "programTransform", "begin": i == 0 && param == "anchor"});
+            s.execute("effects.setParam", p).unwrap();
+        }
+    }
+    assert_eq!(s.history.undo.len(), undo + 1);
+    assert_eq!(motion(&s).1, filmcraft_project::ParamValue::Vec2(filmcraft_geom::Vec2::new(530.0, 330.0)));
+    s.undo();
+    assert_eq!(motion(&s), start);
+}
+
+/// #639: `effects.select` names the effect whose handles the Program monitor shows. It and the
+/// mask selection replace each other; undo or removal that takes the effect away clears it.
+#[test]
+fn selecting_an_effect_replaces_the_mask_selection() {
+    let mut s = demo_unlocked();
+    let id = v1(&s)[0].0;
+    let motion_sel = Some(EffectSel { clip: ClipId(id), effect: "motion".into(), instance: 0 });
+    s.execute("effects.select", json!({"clip": id, "effect": "motion"})).unwrap();
+    assert_eq!(s.state.selected_effect, motion_sel);
+    // applying an effect puts it first; Motion stays the selected effect
+    s.execute("effects.apply", json!({"clips": [id], "effect": "gaussian_blur"})).unwrap();
+    assert_eq!(s.state.selected_effect, motion_sel);
+    s.execute("effects.remove", json!({"clip": id, "index": 0})).unwrap();
+    assert_eq!(s.state.selected_effect, motion_sel, "and when one before it is removed");
+    let motion = s.active_sequence().unwrap().find_item(ClipId(id)).unwrap().1.effects.iter().position(|e| e.effect == "motion").unwrap();
+    s.execute("masks.add", json!({"clip": id, "shape": "ellipse"})).unwrap();
+    assert!(s.state.selected_effect.is_none(), "a new mask is selected instead");
+    s.execute("effects.select", json!({"clip": id, "effect": motion})).unwrap();
+    assert!(s.state.selected_mask.is_none());
+    s.execute("masks.select", json!({"clip": id, "effect": "opacity", "mask": 0})).unwrap();
+    assert!(s.state.selected_effect.is_none());
+    s.execute("effects.select", json!({"none": true})).unwrap();
+    assert!(s.state.selected_effect.is_none());
+    // an applied effect that undo takes away, and one removed
+    s.execute("effects.apply", json!({"clips": [id], "effect": "transform"})).unwrap();
+    s.execute("effects.select", json!({"clip": id, "effect": "transform"})).unwrap();
+    assert!(s.state.selected_effect.is_some());
+    s.undo();
+    assert!(s.state.selected_effect.is_none(), "selection follows undo");
+    s.redo();
+    s.execute("effects.select", json!({"clip": id, "effect": "transform"})).unwrap();
+    let effects = s.active_sequence().unwrap().find_item(ClipId(id)).unwrap().1.effects.clone();
+    let index = s.state.selected_effect.as_ref().unwrap().index(&effects).unwrap();
+    s.execute("effects.remove", json!({"clip": id, "index": index})).unwrap();
+    assert!(s.state.selected_effect.is_none());
+    // hostile parameters are errors, not panics
+    for p in [
+        json!({}),
+        json!({"clip": id}),
+        json!({"clip": id, "effect": 9999}),
+        json!({"clip": id, "effect": -1}),
+        json!({"clip": id, "effect": u64::MAX}),
+        json!({"clip": id, "effect": "no_such_effect"}),
+        json!({"clip": u64::MAX, "effect": 0}),
+        json!({"clip": "x", "effect": 0}),
+    ] {
+        assert!(s.execute("effects.select", p.clone()).is_err(), "{p}");
+    }
+}
+
+/// The demo's first video transition between two clips: (id, start, duration, cut).
+fn demo_crossing(s: &Session) -> (u64, Tick, Tick, Tick) {
+    let q = s.active_sequence().unwrap();
+    q.video_tracks
+        .iter()
+        .find_map(|t| {
+            t.transitions.iter().find(|x| x.from.is_some() && x.to.is_some()).map(|x| (x.id.0, x.start, x.duration, t.item(x.to.unwrap()).unwrap().start))
+        })
+        .expect("the demo has a transition between two clips")
+}
+
+fn transition_ids(s: &Session) -> Vec<u64> {
+    s.active_sequence().unwrap().all_tracks().flat_map(|t| t.transitions.iter().map(|x| x.id.0)).collect()
+}
+
+/// #430: a transition can be selected (it replaces the clip selection and back), Delete removes
+/// it and leaves its clips, undo brings it back; Ripple Delete is not for a transition alone.
+#[test]
+fn transitions_select_and_delete() {
+    let mut s = demo();
+    let (tid, ..) = demo_crossing(&s);
+    let clips = s.active_sequence().unwrap().all_tracks().map(|t| t.items.len()).sum::<usize>();
+    let some_clip = s.active_sequence().unwrap().video_tracks[0].items[0].id.0;
+    s.execute("timeline.select", json!({"clips": [some_clip]})).unwrap();
+    let r = s.execute("timeline.select", json!({"transitions": [tid]})).unwrap();
+    assert_eq!(r["transitionSelection"], json!([tid]));
+    assert!(s.state.selection.is_empty(), "selecting a transition replaces the clip selection");
+    assert!(s.execute("timeline.select", json!({"transitions": [987_654]})).is_err(), "unknown ids are refused");
+    assert!(s.execute("edit.rippleDelete", json!({})).is_err(), "Ripple Delete needs clips");
+    let before = (*s.project).clone();
+    s.execute("edit.clear", json!({})).unwrap();
+    assert!(!transition_ids(&s).contains(&tid), "Delete removes the selected transition");
+    assert_eq!(s.active_sequence().unwrap().all_tracks().map(|t| t.items.len()).sum::<usize>(), clips, "and leaves the clips");
+    assert!(s.state.transition_selection.is_empty());
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, before, "one undo step");
+    // selecting clips clears a transition selection
+    s.execute("timeline.select", json!({"transitions": [tid]})).unwrap();
+    s.execute("timeline.select", json!({"clips": [some_clip]})).unwrap();
+    assert!(s.state.transition_selection.is_empty());
+    // by id, without a selection
+    s.execute("sequence.removeTransition", json!({"transitions": [tid]})).unwrap();
+    assert!(!transition_ids(&s).contains(&tid));
+    assert!(s.execute("sequence.removeTransition", json!({"transitions": [tid]})).is_err(), "nothing left to remove");
+    assert!(s.execute("sequence.removeTransition", json!({})).is_err(), "nothing given or selected");
+}
+
+/// #224 / Effect Controls: Duration follows the alignment, Alignment re-aligns on the cut, Start
+/// moves it (Custom Start), all within the clips it joins; a drag is one undo step.
+#[test]
+fn transition_duration_alignment_and_position() {
+    let mut s = demo();
+    let rate = s.sequence_rate();
+    let f = |n: i64| rate.tick_of(n);
+    let (tid, _, _, cut) = demo_crossing(&s);
+    let set = |s: &mut Session, p: Value| {
+        let mut p = p;
+        p["transition"] = json!(tid);
+        s.execute("sequence.setTransition", p)
+    };
+    let r = set(&mut s, json!({"align": "start"})).unwrap();
+    assert_eq!((r["start"].as_i64(), r["align"].as_str()), (Some(cut.0), Some("start")));
+    // Start at Cut: only the end moves
+    let r = set(&mut s, json!({"frames": 10})).unwrap();
+    assert_eq!((r["start"].as_i64(), r["duration"].as_i64()), (Some(cut.0), Some(f(10).0)));
+    // End at Cut: only the beginning moves
+    let r = set(&mut s, json!({"align": "end", "frames": 8})).unwrap();
+    assert_eq!((r["start"].as_i64(), r["duration"].as_i64(), r["align"].as_str()), (Some((cut - f(8)).0), Some(f(8).0), Some("end")));
+    // Center at Cut: both ends
+    let r = set(&mut s, json!({"align": "center", "frames": 12})).unwrap();
+    assert_eq!((r["start"].as_i64(), r["align"].as_str()), (Some((cut - f(6)).0), Some("center")));
+    // dragging it over the cut: Custom Start; then a new duration keeps its middle
+    let r = set(&mut s, json!({"start": (cut - f(3)).0})).unwrap();
+    assert_eq!(r["align"], json!("custom"));
+    let r = set(&mut s, json!({"frames": 6})).unwrap();
+    assert_eq!((r["start"].as_i64(), r["duration"].as_i64()), (Some(cut.0), Some(f(6).0)), "centre at cut + 3 frames, 6 frames long");
+    // dragging one edge: start and duration together
+    let r = set(&mut s, json!({"start": (cut - f(4)).0, "duration": f(10).0})).unwrap();
+    assert_eq!((r["start"].as_i64(), r["duration"].as_i64()), (Some((cut - f(4)).0), Some(f(10).0)));
+    // refused, and nothing changes
+    let before = (*s.project).clone();
+    let history = s.history.undo.len();
+    for p in [
+        json!({"frames": 0}),
+        json!({"frames": 100_000_000}),
+        json!({"duration": -5}),
+        json!({"duration": i64::MAX}),
+        json!({"frames": 10, "duration": f(10).0}),
+        json!({"align": "middle"}),
+        json!({"align": "start", "start": cut.0}),
+        json!({"start": i64::MIN}),
+        json!({"start": (cut + f(1)).0, "duration": f(1).0}),
+    ] {
+        assert!(set(&mut s, p.clone()).is_err(), "{p}");
+        assert_eq!(*s.project, before, "{p}");
+        assert_eq!(s.history.undo.len(), history, "{p}");
+    }
+    assert!(s.execute("sequence.setTransition", json!({"transition": 987_654, "frames": 5})).is_err());
+    // a drag (merge) is one undo step
+    let history = s.history.undo.len();
+    for (i, n) in [11, 12, 13, 14].into_iter().enumerate() {
+        set(&mut s, json!({"frames": n, "merge": true, "begin": i == 0})).unwrap();
+    }
+    assert_eq!(s.history.undo.len(), history + 1);
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, before);
+}
+
 /// #484: Enable flips each selected clip on its own, as in Premiere. With one enabled and one
 /// disabled clip selected it swaps them, instead of first making both the same.
 #[test]
@@ -763,4 +1085,79 @@ fn enable_flips_each_selected_clip() {
     s.execute("clip.enable", json!({"clips": [b]})).unwrap();
     s.execute("clip.enable", json!({"clips": [a, b]})).unwrap();
     assert_eq!((enabled(&s, a), enabled(&s, b)), (true, true));
+}
+
+/// #580: Escape takes back what a gesture changed, merged or not: the project returns to the mark,
+/// neither undo nor redo keeps the changes, and older steps stay.
+#[test]
+fn reverting_to_a_mark_takes_back_a_gesture_without_redo() {
+    let mut s = demo_unlocked();
+    let id = v1(&s)[0].0;
+    let opacity = |s: &Session| {
+        let q = s.active_sequence().unwrap();
+        let it = q.find_item(ClipId(id)).unwrap().1;
+        it.effects.iter().find(|e| e.effect == "opacity").unwrap().params["opacity"].value.as_f64().unwrap()
+    };
+    let set = |s: &mut Session, v: f64, merge: bool, begin: bool| {
+        s.execute("effects.setParam", json!({"clip": id, "effect": "opacity", "param": "opacity", "value": v, "merge": merge, "begin": begin})).unwrap();
+    };
+    set(&mut s, 80.0, false, false); // an earlier edit, kept
+    let (start, undo, mark) = (opacity(&s), s.history.undo.len(), s.undo_mark());
+    set(&mut s, 90.0, true, true); // a merged drag…
+    set(&mut s, 70.0, true, false);
+    set(&mut s, 60.0, false, false); // …and changes made one step each
+    set(&mut s, 50.0, false, false);
+    assert_eq!(s.revert_to(mark), 3);
+    assert_eq!(opacity(&s), start, "the value at the mark");
+    assert_eq!(s.history.undo.len(), undo, "the earlier step stays");
+    assert!(s.history.redo.is_empty(), "nothing to redo");
+    assert_eq!(s.revert_to(mark), 0, "nothing left to take back");
+    s.undo();
+    assert_eq!(opacity(&s), 100.0, "undo still takes back the earlier edit");
+}
+
+/// A mark no longer in the history does nothing; an older mark still takes back what followed it.
+#[test]
+fn reverting_to_a_lost_mark_does_nothing() {
+    let mut s = demo_unlocked();
+    let id = v1(&s)[0].0;
+    let (base, start) = (s.history.undo.len(), s.undo_mark());
+    s.execute("effects.setParam", json!({"clip": id, "effect": "opacity", "param": "opacity", "value": 40.0})).unwrap();
+    let mark = s.undo_mark();
+    s.undo();
+    s.execute("effects.setParam", json!({"clip": id, "effect": "opacity", "param": "opacity", "value": 30.0})).unwrap();
+    assert_eq!(s.revert_to(mark), 0, "the marked step was undone and replaced");
+    assert_eq!(s.revert_to(start), 1);
+    assert_eq!(s.history.undo.len(), base);
+}
+
+/// Times before sequence start are unreachable in the GUI and cut off on export.
+#[test]
+fn negative_place_and_marker_times_are_refused() {
+    let mut s = demo();
+    let item = s.active_sequence().unwrap().video_tracks[0].items[0].item;
+    let before = s.project.clone();
+    let n_markers = s.active_sequence().unwrap().markers.len();
+    let n_clips: usize = s.active_sequence().unwrap().video_tracks.iter().map(|t| t.items.len()).sum();
+    for (cmd, params) in [
+        ("timeline.place", json!({"item": item.0, "frame": -12})),
+        ("timeline.place", json!({"item": item.0, "seconds": -1.0})),
+        ("timeline.place", json!({"item": item.0, "time": -1})),
+        ("markers.add", json!({"frame": -10})),
+        ("markers.add", json!({"seconds": -0.5})),
+        ("markers.add", json!({"time": i64::MIN})),
+        ("markers.addChapter", json!({"frame": -1})),
+        ("markers.addRange", json!({"time": -1, "durationFrames": 10})),
+        ("markers.addFlashCue", json!({"frame": -3})),
+    ] {
+        let e = s.execute(cmd, params.clone()).expect_err(&format!("{cmd} {params}"));
+        assert!(matches!(&e, EngineError::BadParams { cmd: c, msg } if c == cmd && msg.contains("negative")), "{cmd} {params}: {e:?}");
+        assert_eq!(*s.project, *before);
+    }
+    assert_eq!(s.active_sequence().unwrap().markers.len(), n_markers);
+    let n_clips_after: usize = s.active_sequence().unwrap().video_tracks.iter().map(|t| t.items.len()).sum();
+    assert_eq!(n_clips_after, n_clips);
+    s.execute("timeline.place", json!({"item": item.0, "frame": 0})).unwrap();
+    s.execute("markers.add", json!({"frame": 0, "name": "start"})).unwrap();
+    assert!(s.active_sequence().unwrap().markers.iter().any(|m| m.start == Tick::ZERO && m.name == "start"));
 }
